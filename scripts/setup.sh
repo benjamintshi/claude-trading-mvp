@@ -29,7 +29,7 @@ set -a; source .env; set +a
 # 4. Create DB
 echo "Creating database..."
 createdb claude_trader 2>/dev/null || echo "  (database already exists)"
-python3 -c "import sys; sys.path.insert(0, '.'); from lib.db import init_db; init_db()"
+.venv/bin/python3 -c "import sys; sys.path.insert(0, '.'); from lib.db import init_db; init_db()"
 echo "✅ Database initialized"
 
 # 5. Create directories
@@ -48,7 +48,7 @@ echo "✅ Cron: every 15 minutes"
 # 8. Test
 echo ""
 echo "=== Testing ==="
-python3 -c "
+.venv/bin/python3 -c "
 import sys; sys.path.insert(0, '.')
 from lib.binance import get_price, get_funding_rate
 print(f'BTC: \${get_price(\"BTCUSDT\"):,.2f}')

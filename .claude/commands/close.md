@@ -5,72 +5,50 @@
 
 ## 执行步骤
 
-### 1. 查看当前持仓
+### 1. 查看持仓 + 当前价格
 
 ```bash
-psql trend_lab -c "
-SELECT pr.id, ar.alpha_name, s.symbol, pr.side,
-  round(pr.entry_price::numeric, 4) as entry,
-  round(pr.stop_loss::numeric, 4) as stop,
-  pr.entry_time
-FROM position_record pr
-JOIN alpha_run ar ON ar.id = pr.alpha_run_id
-JOIN symbol s ON s.id = pr.symbol_id
-WHERE pr.status = 'open'
-ORDER BY pr.entry_time"
+cd ~/claude/claude-trading-mvp && python3 -c "
+import sys; sys.path.insert(0, '.')
+from lib.db import get_open_positions
+from lib.binance import get_price
+
+positions = get_open_positions()
+if not positions:
+    print('无持仓')
+else:
+    for p in positions:
+        pos_id, symbol, side, entry, qty, stop, target = p[0], p[1], p[2], p[3], p[4], p[5], p[6]
+        try:
+            current = get_price(symbol)
+            pnl = (current - entry) * qty if side == 'long' else (entry - current) * qty
+            pnl_pct = pnl / (entry * qty) * 100
+            print(f'ID:{pos_id} {symbol} {side} entry:\${entry:.4f} now:\${current:.4f} PnL:\${pnl:+.2f} ({pnl_pct:+.1f}%)')
+        except:
+            print(f'ID:{pos_id} {symbol} {side} entry:\${entry:.4f}')
+"
 ```
 
-### 2. 获取当前价格
+### 2. 平仓
 
 ```bash
-curl -s "https://fapi.binance.com/fapi/v1/ticker/price?symbol={SYMBOL}" | python3 -c "import sys,json; print(json.load(sys.stdin)['price'])"
-```
+cd ~/claude/claude-trading-mvp && python3 -c "
+import sys; sys.path.insert(0, '.')
+from lib.db import close_position, get_open_positions
+from lib.binance import get_price
+from lib.notify import notify_close
 
-### 3. 计算 PnL
+pos_id = {position_id}
+exit_price = get_price('{symbol}')
+reason = '{reason}'
 
-```
-对于做多: PnL = (current_price - entry_price) * quantity
-对于做空: PnL = (entry_price - current_price) * quantity
-扣除手续费: PnL - (entry_notional + exit_notional) * 0.00075
-```
-
-### 4. 更新 DB
-
-```bash
-psql trend_lab -c "
-UPDATE position_record SET
-  status = 'closed',
-  exit_price = {current_price},
-  pnl = {calculated_pnl},
-  exit_time = now()
-WHERE id = {position_id}
-RETURNING id, round(pnl::numeric, 2) as pnl"
-```
-
-### 5. 发送 Telegram 通知
-
-```bash
-source .env
-MSG="🔴 *MC 平仓*
-━━━━━━━━━━━━━━━━
-📊 {symbol} {side}
-💰 入场: \${entry} → 出场: \${exit}
-📈 盈亏: \${pnl} ({pnl_pct}%)
-⏱ 持仓: {duration}
-💡 理由: {reason}"
-
-curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-  -d chat_id="${TELEGRAM_CHAT_ID}" \
-  -d text="$MSG" \
-  -d parse_mode="Markdown"
-```
-
-### 6. 输出确认
-
-```
-✅ 平仓成功
-  {symbol} {side}: ${entry} → ${exit}
-  盈亏: ${pnl} ({pnl_pct}%)
-  持仓时间: {duration}
-  理由: {reason}
+result = close_position(pos_id, exit_price, reason)
+if result:
+    # 获取原始持仓信息用于通知
+    notify_close('{symbol}', '{side}', {entry_price}, exit_price,
+                 result['pnl'], result['pnl_pct'], result['duration_hours'], reason)
+    print(f'✅ 平仓成功 PnL:\${result[\"pnl\"]:+.2f} ({result[\"pnl_pct\"]:+.1f}%)')
+else:
+    print('❌ 平仓失败（持仓不存在或已关闭）')
+"
 ```
