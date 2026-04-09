@@ -1,132 +1,98 @@
 #!/bin/bash
-# Claude Trader — Autonomous trading cycle
-# Runs via cron every 15 minutes.
+# Claude Trader — 自动交易循环 (每 30 分钟)
+# 架构: 代码做风控 → AI 做判断 → 代码执行
+
+export PATH="$HOME/.local/bin:$HOME/.nvm/versions/node/v24.14.1/bin:/usr/local/bin:$PATH"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
-echo "[$TIMESTAMP] Trade cycle starting..." >> data/logs/trade.log
+LOG_DIR="$PROJECT_DIR/data/logs"
+mkdir -p "$LOG_DIR"
 
-# Load env
+echo "[$TIMESTAMP] Trade cycle starting..." >> "$LOG_DIR/trade.log"
+
+# 加载环境变量
 set -a; source "$PROJECT_DIR/.env" 2>/dev/null; set +a
 
+# 先跑止损管理 (纯代码, 不需要 AI)
+python3 "$PROJECT_DIR/scripts/position_manager.py" >> "$LOG_DIR/position_mgr.log" 2>&1
+
+# AI 交易循环 (需要 ANTHROPIC_API_KEY，没有则跳过)
+if ! command -v claude &>/dev/null || [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "[$TIMESTAMP] 跳过 AI 扫描 (无 API key，止损管理已执行)" >> "$LOG_DIR/trade.log"
+    exit 0
+fi
+
 claude -p --dangerously-skip-permissions --max-budget-usd 0.50 "
-你是 MC，加密交易员。执行一次交易循环。
+执行交易循环。你是 MC，交易员。
 
-## 1. 检查持仓
-\`\`\`bash
-cd $PROJECT_DIR && python3 -c \"
-import sys; sys.path.insert(0, '.')
-from lib.db import get_open_positions, get_stats
-positions = get_open_positions()
-if positions:
-    for p in positions:
-        print(f'ID:{p[0]} {p[1]} {p[2]} entry:{p[3]} stop:{p[5]} target:{p[6]} hours:{round(((__import__(\"datetime\").datetime.now(__import__(\"datetime\").timezone.utc) - p[8]).total_seconds()/3600) if p[8] else 0, 1)}h')
-else:
-    print('无持仓')
-stats = get_stats()
-if stats and stats[0]:
-    print(f'统计: {stats[0]}笔 {stats[1]}胜/{stats[2]}负 PnL:\${stats[3]}')
-\"
-\`\`\`
-
-对每个持仓获取当前价格判断是否需要平仓：
-\`\`\`bash
+1. 跑系统状态检查:
 python3 -c \"
-import json, urllib.request
-for sym in ['BTCUSDT','AVAXUSDT']:  # 替换为实际持仓币种
-    d = json.loads(urllib.request.urlopen(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}', timeout=5).read())
-    print(f'{sym}: \${float(d[\"price\"]):,.4f}')
+import sys,os;sys.path.insert(0,'$PROJECT_DIR')
+for l in open('$PROJECT_DIR/.env'):
+ l=l.strip()
+ if l and not l.startswith('#') and '=' in l:
+  k,v=l.split('=',1);os.environ.setdefault(k.strip(),v.strip())
+from lib.risk_gateway import get_system_status,check_circuit_breaker
+print(get_system_status())
+b=check_circuit_breaker()
+if not b['can_trade']:print('BREAKER_TRIPPED')
 \"
-\`\`\`
 
-如果触止损或到目标，用 lib/db.py 平仓：
-\`\`\`bash
+如果输出 BREAKER_TRIPPED，输出报告后结束，不扫描。
+
+2. 扫描市场 (top 30 按成交量):
 python3 -c \"
-import sys; sys.path.insert(0, '.')
-from lib.db import close_position
-from lib.notify import notify_close
-# close_position(pos_id, exit_price, 'reason')
+import sys,os;sys.path.insert(0,'$PROJECT_DIR')
+for l in open('$PROJECT_DIR/.env'):
+ l=l.strip()
+ if l and not l.startswith('#') and '=' in l:
+  k,v=l.split('=',1);os.environ.setdefault(k.strip(),v.strip())
+from lib.binance import get_tradable_symbols,get_signal_snapshot
+btc=get_signal_snapshot('BTCUSDT');bc=btc['change_pct']
+print(f'BTC \${btc[\"price\"]:,.2f} ({bc:+.1f}%) RSI:{btc[\"rsi\"]:.0f} Fund:{btc[\"funding_rate\"]*100:+.4f}% {btc[\"ema_trend\"]} L/S:{btc[\"long_short_ratio\"]:.2f}')
+for c in get_tradable_symbols(top_n=30):
+ sym=c['symbol']
+ if sym=='BTCUSDT':continue
+ try:
+  s=get_signal_snapshot(sym);vs=s['change_pct']-bc;f=s['funding_rate']*100
+  flags=''
+  if s['rsi']<30 or s['rsi']>70:flags+='⚡'
+  if abs(vs)>3:flags+='📊'
+  if s['long_short_ratio']>2 or s['long_short_ratio']<0.5:flags+='👥'
+  if flags:print(f'{sym:14s} \${s[\"price\"]:>10.4f} {s[\"change_pct\"]:+.1f}% vs:{vs:+.1f}% RSI:{s[\"rsi\"]:.0f} Fund:{f:+.4f}% L/S:{s[\"long_short_ratio\"]:.2f} {s[\"ema_trend\"]} {flags}')
+ except:pass
 \"
-\`\`\`
 
-## 2. 扫描市场
-\`\`\`bash
+3. 获取 Fear & Greed:
+curl -s 'https://api.alternative.me/fng/?limit=1'
+
+4. 用你的判断力决定有没有机会。不要打分。
+   如果有机会: 做牛熊辩论 (牛>熊+3)，推理审计通过后，跑风控检查再开仓。
+   如果没有: 说没有，结束。
+
+开仓时用这个:
 python3 -c \"
-import json, urllib.request
-symbols = ['BTCUSDT','ETHUSDT','SOLUSDT','AVAXUSDT','SUIUSDT','ARBUSDT','RENDERUSDT','NEARUSDT','DOTUSDT','OPUSDT','LINKUSDT','ICPUSDT','HBARUSDT','FETUSDT','APTUSDT']
-for sym in symbols:
-    try:
-        d = json.loads(urllib.request.urlopen(f'https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={sym}', timeout=5).read())
-        print(f'{sym:14s} \${float(d[\"lastPrice\"]):>10.4f}  24h:{float(d[\"priceChangePercent\"]):+.1f}%')
-    except: pass
+import sys,os;sys.path.insert(0,'$PROJECT_DIR')
+for l in open('$PROJECT_DIR/.env'):
+ l=l.strip()
+ if l and not l.startswith('#') and '=' in l:
+  k,v=l.split('=',1);os.environ.setdefault(k.strip(),v.strip())
+from lib.risk_gateway import pre_trade_check,calc_position_size
+from lib.binance import open_position_with_sl_tp,get_price
+sym='SYMBOL';side='SIDE';conv='CONVICTION'
+entry=get_price(sym);stop=STOP;target=TARGET
+r=pre_trade_check(sym,side,entry,stop,target)
+if not r['pass']:print(r['reason']);sys.exit(1)
+s=calc_position_size(entry,stop,r['regime'],r['correlation']['penalty'],r['details']['circuit_breaker']['size_multiplier'],conv)
+q=round(s['quantity'],4)
+open_position_with_sl_tp(sym,side,q,stop,target,3)
+print(f'OK {sym} {side.upper()} qty={q} risk=\${s[\"risk_usd\"]:.2f}')
 \"
-\`\`\`
 
-获取 funding 和 Fear&Greed：
-\`\`\`bash
-python3 -c \"
-import json, urllib.request
-for sym in ['BTCUSDT','ETHUSDT','SOLUSDT']:
-    d = json.loads(urllib.request.urlopen(f'https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}&limit=1', timeout=5).read())[0]
-    print(f'{sym}: {float(d[\"fundingRate\"])*100:+.4f}%')
-\"
-curl -s 'https://api.alternative.me/fng/?limit=1' | python3 -c \"import sys,json; d=json.load(sys.stdin)['data'][0]; print(f'F&G: {d[\"value\"]} ({d[\"value_classification\"]})')\"
-\`\`\`
+规则: 风控硬门槛不可绕过 | conviction决定仓位 | 没机会不做
+" >> "$LOG_DIR/trade_output.log" 2>&1
 
-## 3. 搜索新闻（用 WebSearch）
-搜索 'bitcoin crypto market today' 获取最新动态。
-
-## 4. 评分判断
-对每个潜在机会用 10 分制评估。≥ 6 分开仓。
-
-## 5. 执行
-如需开仓：
-\`\`\`bash
-python3 -c \"
-import sys; sys.path.insert(0, '.')
-from lib.db import open_position
-from lib.binance import calc_quantity, get_price
-from lib.notify import notify_open
-
-symbol = 'XXXUSDT'
-side = 'long'
-entry = get_price(symbol)
-stop = entry * 0.97  # 示例
-target = entry * 1.03
-qty = calc_quantity(symbol, 2000, 0.01, entry, stop, 3)
-
-pos_id = open_position(symbol, side, entry, stop, target, qty, '理由', score=7)
-notify_open(symbol, side, entry, stop, target, '理由', qty, 7)
-print(f'开仓成功 ID:{pos_id}')
-\"
-\`\`\`
-
-如需平仓：
-\`\`\`bash
-python3 -c \"
-import sys; sys.path.insert(0, '.')
-from lib.db import close_position
-from lib.notify import notify_close
-result = close_position(POS_ID, EXIT_PRICE, '理由')
-if result:
-    notify_close('SYMBOL', 'SIDE', ENTRY, EXIT_PRICE, result['pnl'], result['pnl_pct'], result['duration_hours'], '理由')
-\"
-\`\`\`
-
-## 6. 写报告
-\`\`\`bash
-cat > $PROJECT_DIR/data/trades/$(date -u '+%Y%m%d-%H%M').md << 'REPORT'
-# 交易报告内容
-REPORT
-\`\`\`
-
-## 规则
-- 没有好机会不开仓
-- 每笔必须有止损和目标
-- 赔率 > 1.5:1
-- 最多 5 笔持仓
-" >> data/logs/trade_output.log 2>&1
-
-echo "[$TIMESTAMP] Trade cycle complete" >> data/logs/trade.log
+echo "[$TIMESTAMP] Trade cycle complete" >> "$LOG_DIR/trade.log"

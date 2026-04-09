@@ -1,0 +1,75 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Grep(**)",
+      "Bash(python3 *)",
+      "Bash(pytest *)",
+      "Bash(ruff *)",
+      "Bash(mypy *)",
+      "Bash(git *)",
+      "Bash(cat *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(psql *)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(curl -s https://api.alternative.me/*)",
+      "Bash(curl -s https://fapi.binance.com/*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /)*",
+      "Bash(rm -rf ~)*",
+      "Bash(sudo *)",
+      "Bash(curl * | bash)*",
+      "Bash(DROP TABLE *)",
+      "Bash(DELETE FROM *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          "python3 .claude/hooks/dangerous-command-blocker.py"
+        ],
+        "description": "Block dangerous commands (rm -rf, DROP, force push, etc.)"
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          "python3 .claude/hooks/trading-safety-guard.py"
+        ],
+        "description": "Protect risk parameters and position sizing logic"
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          "python3 .claude/hooks/trading-safety-guard.py"
+        ],
+        "description": "Protect risk parameters and position sizing logic"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          "python3 .claude/hooks/quality-gate.py"
+        ],
+        "description": "Remind to run tests after editing Python files"
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          "python3 .claude/hooks/quality-gate.py"
+        ],
+        "description": "Remind to run tests after writing Python files"
+      }
+    ]
+  }
+}

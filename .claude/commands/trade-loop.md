@@ -1,115 +1,84 @@
-全自动交易循环。扫描市场、发现机会、自动开仓、管理持仓。
+全自动交易循环。代码做风控 → AI 做判断 → 代码执行。
 
 用法: /trade-loop
 
-## 每次执行的完整流程
+## 你的角色
 
-### 1. 检查现有持仓
+你是 MC，交易员。代码已经帮你做好了风控检查和持仓管理。
+你只需要关注: 市场有没有机会、要不要交易、为什么。
+
+## 流程
+
+### 1. 系统状态 + 持仓管理 (代码自动)
 
 ```bash
-cd ~/claude/claude-trading-mvp && python3 -c "
+python3 -c "
 import sys; sys.path.insert(0, '.')
-from lib.db import get_open_positions, get_stats
-from lib.binance import get_price
+from lib.risk_gateway import get_system_status, check_circuit_breaker
 
-positions = get_open_positions()
-if positions:
-    for p in positions:
-        pos_id, symbol, side, entry, qty, stop, target = p[0], p[1], p[2], p[3], p[4], p[5], p[6]
-        current = get_price(symbol)
-        pnl = (current - entry) * qty if side == 'long' else (entry - current) * qty
-        print(f'ID:{pos_id} {symbol} {side} entry:{entry} now:{current:.4f} PnL:\${pnl:+.2f} stop:{stop} target:{target}')
-else:
+print(get_system_status())
+breaker = check_circuit_breaker()
+if not breaker['can_trade']:
+    print()
+    print('🔴 熔断触发，本次循环只管理持仓，不开新仓。')
+"
+```
+
+```bash
+python3 scripts/position_manager.py
+```
+
+**如果熔断触发 → 只看持仓状态，不扫描不开仓。**
+
+### 2. 持仓概览
+
+```bash
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from lib.binance import get_position_risk, get_open_orders, calc_atr, get_klines
+
+positions = get_position_risk()
+active = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
+
+if not active:
     print('无持仓')
-stats = get_stats()
-if stats and stats[0]:
-    print(f'历史: {stats[0]}笔 {stats[1]}W/{stats[2]}L PnL:\${stats[3]}')
+else:
+    for p in active:
+        symbol = p['symbol']
+        amt = float(p['positionAmt'])
+        side = 'LONG' if amt > 0 else 'SHORT'
+        entry = float(p['entryPrice'])
+        mark = float(p['markPrice'])
+        pnl = float(p['unRealizedProfit'])
+        orders = get_open_orders(symbol)
+        has_stop = any(o['type'] in ('STOP_MARKET', 'TRAILING_STOP_MARKET') for o in orders)
+        print(f'{symbol} {side} entry:\${entry:.4f} mark:\${mark:.4f} PnL:\${pnl:+.2f} 止损:{\"✅\" if has_stop else \"❌\"}')
 "
 ```
 
-对每个持仓判断：
-- 触止损 → 平仓（用 /close）
-- 到目标 → 平仓
-- 持仓超 48h → 评估
-- 市场条件变化 → 评估
+### 3. 扫描市场 (AI 判断)
 
-### 2. 扫描市场
+执行 /scan 的完整流程。看数据、做判断、找机会。
 
-执行 /scan 的完整流程（获取价格、funding、F&G、搜索新闻）。
+### 4. 开仓 (如果有机会)
 
-### 3. 信号叠加评分（满分 10）
+如果你找到了机会，用 /open 开仓。
+如果没有好机会，就说没有。不交易也是交易。
 
-**做多信号：**
-- 关键支撑位 (+2)
-- 24h 跌幅异常大于大盘 (+2)
-- Funding 偏负（空头拥挤）(+1)
-- Fear & Greed < 20 (+1)
-- RSI < 30 (+1)
-- 利好催化剂 (+1)
-- 成交量放大 (+1)
-- 高时间框架支持 (+1)
-
-**做空信号：**
-- 关键阻力位 (+2)
-- 24h 涨幅异常大于大盘 (+2)
-- Funding 偏正（多头拥挤）(+1)
-- Fear & Greed > 80 (+1)
-- RSI > 70 (+1)
-- 利空催化剂 (+1)
-- 成交量放大 (+1)
-- 高时间框架支持 (+1)
-
-**≥ 6 → 开仓 | 4-5 → 观察 | < 4 → 忽略**
-
-### 4. 执行开仓
-
-```bash
-cd ~/claude/claude-trading-mvp && python3 -c "
-import sys; sys.path.insert(0, '.')
-from lib.binance import calc_quantity, get_price
-from lib.db import open_position
-from lib.notify import notify_open
-
-symbol = 'XXXUSDT'
-side = 'long'  # or 'short'
-entry = get_price(symbol)
-stop = 0.0   # 设止损
-target = 0.0 # 设目标
-reason = ''
-score = 0
-
-qty = calc_quantity(symbol, 2000, 0.01, entry, stop, 3)
-pos_id = open_position(symbol, side, entry, stop, target, qty, reason, score)
-notify_open(symbol, side, entry, stop, target, reason, qty, score)
-"
-```
-
-### 5. 执行平仓
-
-```bash
-cd ~/claude/claude-trading-mvp && python3 -c "
-import sys; sys.path.insert(0, '.')
-from lib.db import close_position
-from lib.notify import notify_close
-result = close_position(POS_ID, EXIT_PRICE, '理由')
-if result:
-    notify_close(SYMBOL, SIDE, ENTRY, EXIT_PRICE, result['pnl'], result['pnl_pct'], result['duration_hours'], '理由')
-"
-```
-
-### 6. 输出报告
+### 5. 输出报告
 
 ```
 ⏰ 交易循环 — {时间}
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 市场: BTC ${price} | F&G: {value}
-📰 新闻: {headline}
-📂 持仓: {N} 笔 | 操作: {开仓/平仓/维持}
-🎯 机会: {symbol} {方向} 得分 {X}/10
-💰 累计: ${pnl} | 胜率: {wr}%
+━━━━━━━━━━━━━━━━━━━━━━━
+🔋 系统: {状态} | 余额: ${X}
+📊 市场: {regime} | F&G: {value}
+📂 持仓: {N}/5 | 止损: {状态}
+🎯 判断: {今天的市场观点和决定}
 ```
 
 ### 规则
+- 代码风控 (risk_gateway) 是硬门槛，不可绕过
+- 持仓管理 (position_manager.py) 由代码自动执行
+- 你只负责判断: 有没有机会、要不要做、为什么
 - 没有好机会不开仓
-- 最多 5 笔持仓
-- 同方向最多 3 笔
+- 熔断时只看不做
